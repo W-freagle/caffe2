@@ -12,8 +12,6 @@ static_assert(CUDNN_VERSION >= 5000,
 
 namespace caffe2 {
 
-constexpr cudnnBatchNormMode_t kSpatialBNMode = CUDNN_BATCHNORM_SPATIAL;
-
 class CudnnSpatialBNOp final : public SpatialBNOp<CUDAContext> {
  public:
   USE_OPERATOR_FUNCTIONS(CUDAContext);
@@ -27,6 +25,11 @@ class CudnnSpatialBNOp final : public SpatialBNOp<CUDAContext> {
                  << "CUDNN_BN_MIN_EPSILON instead.";
     }
     epsilon_ = std::max(epsilon_, CUDNN_BN_MIN_EPSILON);
+#if CUDNN_VERSION_MIN(7,0,0)
+    mode_ = CUDNN_BATCHNORM_SPATIAL_PERSISTENT;
+#else
+    mode_ = CUDNN_BATCHNORM_SPATIAL;
+#endif
   }
 
   ~CudnnSpatialBNOp() {
@@ -36,7 +39,6 @@ class CudnnSpatialBNOp final : public SpatialBNOp<CUDAContext> {
 
   template <typename T, typename M>
   bool DoRunWithType();
-
   bool RunOnDevice() override;
 
  protected:
@@ -44,6 +46,8 @@ class CudnnSpatialBNOp final : public SpatialBNOp<CUDAContext> {
   cudnnTensorDescriptor_t data_desc_;
   cudnnTensorDescriptor_t bn_param_desc_;
   vector<TIndex> cudnn_input_dims_;
+
+  cudnnBatchNormMode_t mode_;
 };
 
 class CudnnSpatialBNGradientOp final : public SpatialBNGradientOp<CUDAContext> {
@@ -60,6 +64,11 @@ class CudnnSpatialBNGradientOp final : public SpatialBNGradientOp<CUDAContext> {
                  << "CUDNN_BN_MIN_EPSILON instead.";
     }
     epsilon_ = std::max(epsilon_, CUDNN_BN_MIN_EPSILON);
+#if CUDNN_VERSION_MIN(7,0,0)
+    mode_ = CUDNN_BATCHNORM_SPATIAL_PERSISTENT;
+#else
+    mode_ = CUDNN_BATCHNORM_SPATIAL;
+#endif
   }
 
   ~CudnnSpatialBNGradientOp() {
@@ -77,6 +86,8 @@ class CudnnSpatialBNGradientOp final : public SpatialBNGradientOp<CUDAContext> {
   cudnnTensorDescriptor_t data_desc_;
   cudnnTensorDescriptor_t bn_param_desc_;
   vector<TIndex> cudnn_input_dims_;
+
+  cudnnBatchNormMode_t mode_;
 };
 
 
@@ -94,29 +105,47 @@ bool CudnnSpatialBNOp::DoRunWithType() {
   const auto& scale = Input(SCALE);
   const auto& bias = Input(BIAS);
 
-  DCHECK_EQ(X.ndim(), 4);
+  CAFFE_ENFORCE_GE(X.ndim(), 3);
   const int N = X.dim32(0);
-  const int C = (order_ == StorageOrder::NCHW ? X.dim32(1) : X.dim32(3));
+  const int C = X.ndim() > 3
+      ? (order_ == StorageOrder::NCHW ? X.dim32(1) : X.dim32(X.ndim() - 1))
+      : (order_ == StorageOrder::NCHW ? X.dim32(1) : X.dim32(2));
   const int H = (order_ == StorageOrder::NCHW ? X.dim32(2) : X.dim32(1));
-  const int W = (order_ == StorageOrder::NCHW ? X.dim32(3) : X.dim32(2));
-  DCHECK_EQ(scale.ndim(), 1);
-  DCHECK_EQ(bias.ndim(), 1);
-  DCHECK_EQ(scale.dim32(0), C);
-  DCHECK_EQ(bias.dim32(0), C);
+  const int W = X.ndim() > 3
+      ? (order_ == StorageOrder::NCHW ? X.dim32(3) : X.dim32(2))
+      : 1;
+  const int D = X.ndim() > 4
+      ? (order_ == StorageOrder::NCHW ? X.dim32(4) : X.dim32(3))
+      : 1;
+  CAFFE_ENFORCE_EQ(scale.ndim(), 1);
+  CAFFE_ENFORCE_EQ(bias.ndim(), 1);
+  CAFFE_ENFORCE_EQ(scale.dim32(0), C);
+  CAFFE_ENFORCE_EQ(bias.dim32(0), C);
   // See if we need to reshape.
   if (X.dims() != cudnn_input_dims_) {
     VLOG(1) << "Setting descriptors.";
     cudnn_input_dims_ = X.dims();
-    CUDNN_ENFORCE(cudnnSetTensor4dDescriptor(
-        data_desc_,
-        GetCudnnTensorFormat(order_),
-        cudnnTypeWrapper<T>::type,
-        N,
-        C,
-        H,
-        W));
+    if (order_ == StorageOrder::NCHW) {
+      vector<int> dims = {N, C, H, W, D};
+      vector<int> strides = {C * H * W * D, H * W * D, W * D, D, 1};
+      CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
+          data_desc_,
+          cudnnTypeWrapper<T>::type,
+          X.ndim() > 3 ? X.ndim() : 4,
+          dims.data(),
+          strides.data()));
+    } else {
+      vector<int> dims = {N, C, H, W, D};
+      vector<int> strides = {H * W * D * C, 1, W * D * C, D * C, C};
+      CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
+          data_desc_,
+          cudnnTypeWrapper<T>::type,
+          X.ndim() > 3 ? X.ndim() : 4,
+          dims.data(),
+          strides.data()));
+    }
     CUDNN_ENFORCE(cudnnDeriveBNTensorDescriptor(
-        bn_param_desc_, data_desc_, kSpatialBNMode));
+        bn_param_desc_, data_desc_, mode_));
   }
 
   // Now, depending on whether we are running test or not, we have two paths.
@@ -124,16 +153,17 @@ bool CudnnSpatialBNOp::DoRunWithType() {
     // Run inference mode.
     const auto& est_mean = Input(EST_MEAN);
     const auto& est_var = Input(EST_VAR);
-    DCHECK_EQ(est_mean.ndim(), 1);
-    DCHECK_EQ(est_var.ndim(), 1);
-    DCHECK_EQ(est_mean.dim32(0), C);
-    DCHECK_EQ(est_var.dim32(0), C);
+    CAFFE_ENFORCE_EQ(est_mean.ndim(), 1);
+    CAFFE_ENFORCE_EQ(est_var.ndim(), 1);
+    CAFFE_ENFORCE_EQ(est_mean.dim32(0), C);
+    CAFFE_ENFORCE_EQ(est_var.dim32(0), C);
 
     auto* Y = Output(OUTPUT);
     Y->ResizeLike(X);
     CUDNN_ENFORCE(cudnnBatchNormalizationForwardInference(
         cudnn_wrapper_.inline_cudnn_handle(),
-        kSpatialBNMode,
+        // Note: PERSISTENT not implemented for inference
+        CUDNN_BATCHNORM_SPATIAL,
         cudnnTypeWrapper<T>::kOne(),
         cudnnTypeWrapper<T>::kZero(),
         data_desc_,
@@ -174,10 +204,10 @@ bool CudnnSpatialBNOp::DoRunWithType() {
       math::Set<BNParamType, CUDAContext>(C, 0, running_var_data, &context_);
     } else {
       // Does not need to do initialization.
-      DCHECK_EQ(running_mean->ndim(), 1);
-      DCHECK_EQ(running_var->ndim(), 1);
-      DCHECK_EQ(running_mean->dim32(0), C);
-      DCHECK_EQ(running_var->dim32(0), C);
+      CAFFE_ENFORCE_EQ(running_mean->ndim(), 1);
+      CAFFE_ENFORCE_EQ(running_var->ndim(), 1);
+      CAFFE_ENFORCE_EQ(running_mean->dim32(0), C);
+      CAFFE_ENFORCE_EQ(running_var->dim32(0), C);
       running_mean_data = running_mean->template mutable_data<BNParamType>();
       running_var_data = running_var->template mutable_data<BNParamType>();
     }
@@ -191,7 +221,7 @@ bool CudnnSpatialBNOp::DoRunWithType() {
 
     CUDNN_ENFORCE(cudnnBatchNormalizationForwardTraining(
         cudnn_wrapper_.inline_cudnn_handle(),
-        kSpatialBNMode,
+        mode_,
         cudnnTypeWrapper<T>::kOne(),
         cudnnTypeWrapper<T>::kZero(),
         data_desc_,
@@ -231,26 +261,43 @@ bool CudnnSpatialBNGradientOp::DoRunWithType() {
   const auto& scale = Input(SCALE);
   const auto& dY = Input(OUTPUT_GRAD);
 
-  DCHECK_EQ(X.ndim(), 4);
+  CAFFE_ENFORCE_GE(X.ndim(), 3);
   const int N = X.dim32(0);
-  const int C = (order_ == StorageOrder::NCHW ? X.dim32(1) : X.dim32(3));
+  const int C = X.ndim() > 3
+      ? (order_ == StorageOrder::NCHW ? X.dim32(1) : X.dim32(X.ndim() - 1))
+      : (order_ == StorageOrder::NCHW ? X.dim32(1) : X.dim32(2));
   const int H = (order_ == StorageOrder::NCHW ? X.dim32(2) : X.dim32(1));
-  const int W = (order_ == StorageOrder::NCHW ? X.dim32(3) : X.dim32(2));
-  DCHECK_EQ(scale.ndim(), 1);
-  DCHECK_EQ(scale.dim32(0), C);
+  const int W = X.ndim() > 3
+      ? (order_ == StorageOrder::NCHW ? X.dim32(3) : X.dim32(2))
+      : 1;
+  const int D = X.ndim() > 4
+      ? (order_ == StorageOrder::NCHW ? X.dim32(4) : X.dim32(3))
+      : 1;
+  CAFFE_ENFORCE_EQ(scale.ndim(), 1);
+  CAFFE_ENFORCE_EQ(scale.dim32(0), C);
   // See if we need to reshape.
   if (X.dims() != cudnn_input_dims_) {
-    cudnn_input_dims_ = X.dims();
-    CUDNN_ENFORCE(cudnnSetTensor4dDescriptor(
-        data_desc_,
-        GetCudnnTensorFormat(order_),
-        cudnnTypeWrapper<T>::type,
-        N,
-        C,
-        H,
-        W));
+    if (order_ == StorageOrder::NCHW) {
+      vector<int> dims = {N, C, H, W, D};
+      vector<int> strides = {C * H * W * D, H * W * D, W * D, D, 1};
+      CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
+          data_desc_,
+          cudnnTypeWrapper<T>::type,
+          X.ndim() > 3 ? X.ndim() : 4,
+          dims.data(),
+          strides.data()));
+    } else {
+      vector<int> dims = {N, C, H, W, D};
+      vector<int> strides = {H * W * C * D, 1, W * D * C, D * C, C};
+      CUDNN_ENFORCE(cudnnSetTensorNdDescriptor(
+          data_desc_,
+          cudnnTypeWrapper<T>::type,
+          X.ndim() > 3 ? X.ndim() : 4,
+          dims.data(),
+          strides.data()));
+    }
     CUDNN_ENFORCE(cudnnDeriveBNTensorDescriptor(
-        bn_param_desc_, data_desc_, kSpatialBNMode));
+        bn_param_desc_, data_desc_, mode_));
   }
 
   auto* dX = Output(INPUT_GRAD);
@@ -267,7 +314,7 @@ bool CudnnSpatialBNGradientOp::DoRunWithType() {
 
   CUDNN_ENFORCE(cudnnBatchNormalizationBackward(
       cudnn_wrapper_.inline_cudnn_handle(),
-      kSpatialBNMode,
+      mode_,
       cudnnTypeWrapper<T>::kOne(),
       cudnnTypeWrapper<T>::kZero(),
       cudnnTypeWrapper<T>::kOne(),
@@ -299,7 +346,6 @@ bool CudnnSpatialBNGradientOp::RunOnDevice() {
   return true;
 }
 
-namespace {
 // Since there is no default implementation for spatial batch normalization,
 // we will register the cudnn version as the default as well.
 REGISTER_CUDA_OPERATOR(SpatialBN, CudnnSpatialBNOp);
@@ -307,5 +353,4 @@ REGISTER_CUDA_OPERATOR(SpatialBNGradient, CudnnSpatialBNGradientOp);
 
 REGISTER_CUDNN_OPERATOR(SpatialBN, CudnnSpatialBNOp);
 REGISTER_CUDNN_OPERATOR(SpatialBNGradient, CudnnSpatialBNGradientOp);
-}  // namespace
 }  // namespace caffe2

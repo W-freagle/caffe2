@@ -9,11 +9,17 @@ import argparse
 import logging
 import numpy as np
 import time
+import os
 
-from caffe2.python import core, workspace, experiment_util, data_parallel_model, dyndep
-from caffe2.python import timeout_guard, cnn
+from caffe2.python import core, workspace, experiment_util, data_parallel_model
+from caffe2.python import dyndep, optimizer
+from caffe2.python import timeout_guard, model_helper, brew
 
 import caffe2.python.models.resnet as resnet
+from caffe2.python.modeling.initializers import Initializer, pFP16Initializer
+import caffe2.python.predictor.predictor_exporter as pred_exp
+import caffe2.python.predictor.predictor_py_utils as pred_utils
+from caffe2.python.predictor_constants import predictor_constants as predictor_constants
 
 '''
 Parallelized multi-GPU distributed trainer for Resnet 50. Can be used to train
@@ -32,7 +38,6 @@ passing the `file_store_path` argument. Use the latter by passing the
 `redis_host` and `redis_port` arguments.
 '''
 
-
 logging.basicConfig()
 log = logging.getLogger("resnet50_trainer")
 log.setLevel(logging.DEBUG)
@@ -40,15 +45,18 @@ log.setLevel(logging.DEBUG)
 dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:file_store_handler_ops')
 dyndep.InitOpsLibrary('@/caffe2/caffe2/distributed:redis_store_handler_ops')
 
-def AddImageInput(model, reader, batch_size, img_size):
+
+def AddImageInput(model, reader, batch_size, img_size, dtype):
     '''
     Image input operator that loads data from reader and
     applies certain transformations to the images.
     '''
-    data, label = model.ImageInput(
-        reader,
-        ["data", "label"],
+    data, label = brew.image_input(
+        model,
+        reader, ["data", "label"],
         batch_size=batch_size,
+        output_type=dtype,
+        use_gpu_transform=True,
         use_caffe_datum=True,
         mean=128.,
         std=128.,
@@ -60,26 +68,51 @@ def AddImageInput(model, reader, batch_size, img_size):
     data = model.StopGradient(data, data)
 
 
-def AddMomentumParameterUpdate(train_model, LR):
-    '''
-    Add the momentum-SGD update.
-    '''
-    params = train_model.GetParams()
-    assert(len(params) > 0)
+def SaveModel(args, train_model, epoch):
+    prefix = "[]_{}".format(train_model._device_prefix, train_model._devices[0])
+    predictor_export_meta = pred_exp.PredictorExportMeta(
+        predict_net=train_model.net.Proto(),
+        parameters=data_parallel_model.GetCheckpointParams(train_model),
+        inputs=[prefix + "/data"],
+        outputs=[prefix + "/softmax"],
+        shapes={
+            prefix + "/softmax": (1, args.num_labels),
+            prefix + "/data": (args.num_channels, args.image_size, args.image_size)
+        }
+    )
 
-    for param in params:
-        param_grad = train_model.param_to_grad[param]
-        param_momentum = train_model.param_init_net.ConstantFill(
-            [param], param + '_momentum', value=0.0
-        )
+    # save the train_model for the current epoch
+    model_path = "%s/%s_%d.mdl" % (
+        args.file_store_path,
+        args.save_model_name,
+        epoch,
+    )
 
-        # Update param_grad and param_momentum in place
-        train_model.net.MomentumSGDUpdate(
-            [param_grad, param_momentum, LR, param],
-            [param_grad, param_momentum, param],
-            momentum=0.9,
-            nesterov=1,
-        )
+    # set db_type to be "minidb" instead of "log_file_db", which breaks
+    # the serialization in save_to_db. Need to switch back to log_file_db
+    # after migration
+    pred_exp.save_to_db(
+        db_type="minidb",
+        db_destination=model_path,
+        predictor_export_meta=predictor_export_meta,
+    )
+
+
+def LoadModel(path, model):
+    '''
+    Load pretrained model from file
+    '''
+    log.info("Loading path: {}".format(path))
+    meta_net_def = pred_exp.load_from_db(path, 'minidb')
+    init_net = core.Net(pred_utils.GetNet(
+        meta_net_def, predictor_constants.GLOBAL_INIT_NET_TYPE))
+    predict_init_net = core.Net(pred_utils.GetNet(
+        meta_net_def, predictor_constants.PREDICT_INIT_NET_TYPE))
+
+    predict_init_net.RunAllOnGPU()
+    init_net.RunAllOnGPU()
+    assert workspace.RunNetOnce(predict_init_net)
+    assert workspace.RunNetOnce(init_net)
 
 
 def RunEpoch(
@@ -111,12 +144,21 @@ def RunEpoch(
 
         fmt = "Finished iteration {}/{} of epoch {} ({:.2f} images/sec)"
         log.info(fmt.format(i + 1, epoch_iters, epoch, total_batch_size / dt))
+        prefix = "{}_{}".format(
+            train_model._device_prefix,
+            train_model._devices[0])
+        accuracy = workspace.FetchBlob(prefix + '/accuracy')
+        loss = workspace.FetchBlob(prefix + '/loss')
+        train_fmt = "Training loss: {}, accuracy: {}"
+        log.info(train_fmt.format(loss, accuracy))
 
     num_images = epoch * epoch_iters * total_batch_size
-    prefix = "gpu_{}".format(train_model._devices[0])
+    prefix = "{}_{}".format(train_model._device_prefix, train_model._devices[0])
     accuracy = workspace.FetchBlob(prefix + '/accuracy')
     loss = workspace.FetchBlob(prefix + '/loss')
-    learning_rate = workspace.FetchBlob(prefix + '/LR')
+    learning_rate = workspace.FetchBlob(
+        data_parallel_model.GetLearningRateBlobNames(train_model)[0]
+    )
     test_accuracy = 0
     if (test_model is not None):
         # Run 100 iters of testing
@@ -125,7 +167,7 @@ def RunEpoch(
             workspace.RunNet(test_model.net.Proto().name)
             for g in test_model._devices:
                 test_accuracy += np.asscalar(workspace.FetchBlob(
-                    "gpu_{}".format(g) + '/accuracy'
+                    "{}_{}".format(test_model._device_prefix, g) + '/accuracy'
                 ))
                 ntests += 1
         test_accuracy /= ntests
@@ -155,7 +197,7 @@ def Train(args):
         gpus = [int(x) for x in args.gpus.split(',')]
         num_gpus = len(gpus)
     else:
-        gpus = range(args.num_gpus)
+        gpus = list(range(args.num_gpus))
         num_gpus = args.num_gpus
 
     log.info("Running on GPUs: {}".format(gpus))
@@ -173,18 +215,41 @@ def Train(args):
     args.epoch_size = epoch_iters * global_batch_size
     log.info("Using epoch size: {}".format(args.epoch_size))
 
-    # Create CNNModeLhelper object
-    train_model = cnn.CNNModelHelper(
-        order="NCHW",
-        name="resnet50",
-        use_cudnn=True,
-        cudnn_exhaustive_search=True,
-        ws_nbytes_limit=(args.cudnn_workspace_limit_mb * 1024 * 1024),
+    # Create ModelHelper object
+    train_arg_scope = {
+        'order': 'NCHW',
+        'use_cudnn': True,
+        'cudnn_exhaustive_search': True,
+        'ws_nbytes_limit': (args.cudnn_workspace_limit_mb * 1024 * 1024),
+    }
+    train_model = model_helper.ModelHelper(
+        name="resnet50", arg_scope=train_arg_scope
     )
 
     num_shards = args.num_shards
     shard_id = args.shard_id
-    if num_shards > 1:
+
+    # Expect interfaces to be comma separated.
+    # Use of multiple network interfaces is not yet complete,
+    # so simply use the first one in the list.
+    interfaces = args.distributed_interfaces.split(",")
+
+    # Rendezvous using MPI when run with mpirun
+    if os.getenv("OMPI_COMM_WORLD_SIZE") is not None:
+        num_shards = int(os.getenv("OMPI_COMM_WORLD_SIZE", 1))
+        shard_id = int(os.getenv("OMPI_COMM_WORLD_RANK", 0))
+        if num_shards > 1:
+            rendezvous = dict(
+                kv_handler=None,
+                num_shards=num_shards,
+                shard_id=shard_id,
+                engine="GLOO",
+                transport=args.distributed_transport,
+                interface=interfaces[0],
+                mpi_rendezvous=True,
+                exit_nets=None)
+
+    elif num_shards > 1:
         # Create rendezvous for distributed computation
         store_handler = "store_handler"
         if args.redis_host is not None:
@@ -203,46 +268,62 @@ def Train(args):
                 core.CreateOperator(
                     "FileStoreHandlerCreate", [], [store_handler],
                     path=args.file_store_path,
+                    prefix=args.run_id,
                 )
             )
+
         rendezvous = dict(
             kv_handler=store_handler,
             shard_id=shard_id,
             num_shards=num_shards,
             engine="GLOO",
+            transport=args.distributed_transport,
+            interface=interfaces[0],
             exit_nets=None)
+
     else:
         rendezvous = None
 
-
     # Model building functions
     def create_resnet50_model_ops(model, loss_scale):
-        [softmax, loss] = resnet.create_resnet50(
-            model,
-            "data",
-            num_input_channels=args.num_channels,
-            num_labels=args.num_labels,
-            label="label",
-            no_bias=True,
-        )
+        initializer = (pFP16Initializer if args.dtype == 'float16'
+                       else Initializer)
+
+        with brew.arg_scope([brew.conv, brew.fc],
+                            WeightInitializer=initializer,
+                            BiasInitializer=initializer,
+                            enable_tensor_core=args.enable_tensor_core):
+            pred = resnet.create_resnet50(
+                model,
+                "data",
+                num_input_channels=args.num_channels,
+                num_labels=args.num_labels,
+                no_bias=True,
+                no_loss=True,
+            )
+
+        if args.dtype == 'float16':
+            pred = model.net.HalfToFloat(pred, pred + '_fp32')
+
+        softmax, loss = model.SoftmaxWithLoss([pred, 'label'],
+                                              ['softmax', 'loss'])
         loss = model.Scale(loss, scale=loss_scale)
-        model.Accuracy([softmax, "label"], "accuracy")
+        brew.accuracy(model, [softmax, "label"], "accuracy")
         return [loss]
 
-    # SGD
-    def add_parameter_update_ops(model):
-        model.AddWeightDecay(args.weight_decay)
-        ITER = model.Iter("ITER")
+    def add_optimizer(model):
         stepsz = int(30 * args.epoch_size / total_batch_size / num_shards)
-        LR = model.net.LearningRate(
-            [ITER],
-            "LR",
-            base_lr=args.base_learning_rate,
+        optimizer.add_weight_decay(model, args.weight_decay)
+        opt = optimizer.build_multi_precision_sgd(
+            model,
+            args.base_learning_rate,
+            momentum=0.9,
+            nesterov=1,
             policy="step",
             stepsize=stepsz,
-            gamma=0.1,
+            gamma=0.1
         )
-        AddMomentumParameterUpdate(model, LR)
+        return opt
 
     # Input. Note that the reader must be shared with all GPUS.
     reader = train_model.CreateDB(
@@ -259,28 +340,42 @@ def Train(args):
             reader,
             batch_size=batch_per_device,
             img_size=args.image_size,
+            dtype=args.dtype,
         )
 
+    def add_post_sync_ops(model):
+        """Add ops applied after initial parameter sync."""
+        for param_info in model.GetOptimizationParamInfo(model.GetParams()):
+            if param_info.blob_copy is not None:
+                model.param_init_net.HalfToFloat(
+                    param_info.blob,
+                    param_info.blob_copy[core.DataType.FLOAT]
+                )
+
     # Create parallelized model
-    data_parallel_model.Parallelize_GPU(
+    data_parallel_model.Parallelize(
         train_model,
         input_builder_fun=add_image_input,
         forward_pass_builder_fun=create_resnet50_model_ops,
-        param_update_builder_fun=add_parameter_update_ops,
+        optimizer_builder_fun=add_optimizer,
+        post_sync_builder_fun=add_post_sync_ops,
         devices=gpus,
         rendezvous=rendezvous,
         optimize_gradient_memory=True,
+        cpu_device=args.use_cpu,
     )
 
     # Add test model, if specified
     test_model = None
     if (args.test_data is not None):
         log.info("----- Create test net ----")
-        test_model = cnn.CNNModelHelper(
-            order="NCHW",
-            name="resnet50_test",
-            use_cudnn=True,
-            cudnn_exhaustive_search=True
+        test_arg_scope = {
+            'order': "NCHW",
+            'use_cudnn': True,
+            'cudnn_exhaustive_search': True,
+        }
+        test_model = model_helper.ModelHelper(
+            name="resnet50_test", arg_scope=test_arg_scope, init_params=False
         )
 
         test_reader = test_model.CreateDB(
@@ -295,20 +390,40 @@ def Train(args):
                 test_reader,
                 batch_size=batch_per_device,
                 img_size=args.image_size,
+                dtype=args.dtype,
             )
 
-        data_parallel_model.Parallelize_GPU(
+        data_parallel_model.Parallelize(
             test_model,
             input_builder_fun=test_input_fn,
             forward_pass_builder_fun=create_resnet50_model_ops,
+            post_sync_builder_fun=add_post_sync_ops,
             param_update_builder_fun=None,
             devices=gpus,
+            cpu_device=args.use_cpu,
         )
         workspace.RunNetOnce(test_model.param_init_net)
         workspace.CreateNet(test_model.net)
 
     workspace.RunNetOnce(train_model.param_init_net)
     workspace.CreateNet(train_model.net)
+
+    epoch = 0
+    # load the pre-trained model and reset epoch
+    if args.load_model_path is not None:
+        LoadModel(args.load_model_path, train_model)
+
+        # Sync the model params
+        data_parallel_model.FinalizeAfterCheckpoint(train_model)
+
+        # reset epoch. load_model_path should end with *_X.mdl,
+        # where X is the epoch number
+        last_str = args.load_model_path.split('_')[-1]
+        if last_str.endswith('.mdl'):
+            epoch = int(last_str[:-4])
+            log.info("Reset epoch to {}".format(epoch))
+        else:
+            log.warning("The format of load_model_path doesn't match!")
 
     expname = "resnet50_gpu%d_b%d_L%d_lr%.2f_v2" % (
         args.num_gpus,
@@ -319,7 +434,6 @@ def Train(args):
     explog = experiment_util.ModelTrainerLog(expname, args)
 
     # Run the training one epoch a time
-    epoch = 0
     while epoch < args.num_epochs:
         epoch = RunEpoch(
             args,
@@ -332,7 +446,16 @@ def Train(args):
             explog
         )
 
-    # TODO: save final model.
+        # Save the model for each epoch
+        SaveModel(args, train_model, epoch)
+
+        model_path = "%s/%s_" % (
+            args.file_store_path,
+            args.save_model_name
+        )
+        # remove the saved model from the previous epoch if it exists
+        if os.path.isfile(model_path + str(epoch - 1) + ".mdl"):
+            os.remove(model_path + str(epoch - 1) + ".mdl")
 
 
 def main():
@@ -381,6 +504,22 @@ def main():
                         help="Port of Redis server (for rendezvous)")
     parser.add_argument("--file_store_path", type=str, default="/tmp",
                         help="Path to directory to use for rendezvous")
+    parser.add_argument("--save_model_name", type=str, default="resnet50_model",
+                        help="Save the trained model to a given name")
+    parser.add_argument("--load_model_path", type=str, default=None,
+                        help="Load previously saved model to continue training")
+    parser.add_argument("--use_cpu", type=bool, default=False,
+                        help="Use CPU instead of GPU")
+    parser.add_argument('--dtype', default='float',
+                        choices=['float', 'float16'],
+                        help='Data type used for training')
+    parser.add_argument('--enable-tensor-core', action='store_true',
+                        help='Enable Tensor Core math for Conv and FC ops')
+    parser.add_argument("--distributed_transport", type=str, default="tcp",
+                        help="Transport to use for distributed run [tcp|ibverbs]")
+    parser.add_argument("--distributed_interfaces", type=str, default="",
+                        help="Network interfaces to use for distributed run")
+
     args = parser.parse_args()
 
     Train(args)

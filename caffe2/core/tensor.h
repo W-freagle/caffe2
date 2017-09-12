@@ -20,6 +20,11 @@
 // keep the memory allocated for its maximum capacity reshaped to so far.
 CAFFE2_DECLARE_bool(caffe2_keep_on_shrink);
 
+// Since we can have high variance in blob memory allocated across different
+// inputs in the same run, we will shrink the blob only if the memory gain
+// is larger than this flag in bytes.
+CAFFE2_DECLARE_int64(caffe2_max_keep_on_shrink_memory);
+
 namespace caffe2 {
 
 /**
@@ -58,7 +63,6 @@ inline int canonical_axis_index_(int axis_index, int ndims) {
   }
   return axis_index;
 }
-
 
 /**
  * @brief Tensor is the basic class in Caffe2 that stores a contiguous memory
@@ -120,7 +124,7 @@ class Tensor {
   Tensor(const vector<TIndex>& dims, const vector<T>& values, Context* context)
       : meta_(TypeMeta::Make<T>()) {
     Resize(dims);
-    CAFFE_ENFORCE_EQ(values.size(), size_);
+    CAFFE_ENFORCE_EQ_WITH_CALLER(values.size(), size_);
     context->template Copy<T, CPUContext, Context>(size_, values.data(), mutable_data<T>());
   }
 
@@ -181,7 +185,7 @@ class Tensor {
    */
   template <class ContextForCopy>
   void Extend(TIndex num, float growthPct, ContextForCopy* context) {
-    CAFFE_ENFORCE_GE(dims_.size(), 1);
+    CAFFE_ENFORCE_GE_WITH_CALLER(dims_.size(), 1);
     auto newDims = dims_;
     newDims[0] += num;
     if (!data_) {
@@ -225,6 +229,7 @@ class Tensor {
         meta_, oldSize, oldData.get(), newData);
     dims_ = oldDims;
     size_ = oldSize;
+    reserved_ = true;
   }
 
   /**
@@ -234,8 +239,8 @@ class Tensor {
    * that the extra capacity after the end of the shurnk tensor is maintained.
    */
   void Shrink(TIndex outer_dim) {
-    CAFFE_ENFORCE(dims_.size() >= 1, "Tensor must be at least 1D");
-    CAFFE_ENFORCE(
+    CAFFE_ENFORCE_WITH_CALLER(dims_.size() >= 1, "Tensor must be at least 1D");
+    CAFFE_ENFORCE_WITH_CALLER(
         outer_dim <= dims_[0],
         "New outer dimension must be smaller than current.");
     dims_[0] = outer_dim;
@@ -262,12 +267,23 @@ class Tensor {
   template <typename... Ts>
   void Resize(Ts... dim_source) {
     bool size_changed = SetDims(dim_source...);
-    // If needed, we will free the data. the next mutable_data() call
-    // will create the data storage.
-    if (size_changed && (capacity_ < size_ * meta_.itemsize() ||
-                         !FLAGS_caffe2_keep_on_shrink)) {
-      data_.reset();
-      capacity_ = 0;
+    if (size_changed) {
+      // If needed, we will free the data. the next mutable_data() call
+      // will create the data storage.
+      int64_t new_size = size_ * meta_.itemsize();
+      bool reset_tensor = false;
+      if (reserved_) {
+        // If tensor is reserved then don't claim its memeory unless capacity_
+        // is smaller than new size
+        reset_tensor = capacity_ < new_size;
+      } else {
+        reset_tensor = capacity_ < new_size || !FLAGS_caffe2_keep_on_shrink ||
+            capacity_ - new_size > FLAGS_caffe2_max_keep_on_shrink_memory;
+      }
+
+      if (reset_tensor) {
+        FreeMemory();
+      }
     }
   }
 
@@ -290,10 +306,10 @@ class Tensor {
   inline void Reshape(const vector<TIndex>& dims) {
     TIndex new_size = 1;
     for (auto d : dims) {
-      CAFFE_ENFORCE_GE(d, 0);
+      CAFFE_ENFORCE_GE_WITH_CALLER(d, 0);
       new_size *= d;
     }
-    CAFFE_ENFORCE(
+    CAFFE_ENFORCE_WITH_CALLER(
         new_size == size_,
         "New size and old size are not equal. You cannot use Reshape, "
         "but should use Resize."
@@ -307,6 +323,20 @@ class Tensor {
 
   inline void Reshape(const vector<int>& dims) {
     Reshape(ToVectorTIndex(dims));
+  }
+
+  /**
+   * Release whatever memory the tensor was holding but keep size and type
+   * information. Subsequent call to mutable_data will trigger new memory
+   * allocation.
+   */
+  inline void FreeMemory() {
+    data_.reset();
+    capacity_ = 0;
+    // If reserved is true and we changed tensor memory then it is fine
+    // to switch it to false, if Resize is called from Reserve and it triggers
+    // FreeMemory() then reserved_ will be set to true at end of Reserve()
+    reserved_ = false;
   }
 
   /**
@@ -325,6 +355,16 @@ class Tensor {
     return ss.str();
   }
 
+  void swap(Tensor<Context>& other) {
+    std::swap(dims_, other.dims_);
+    std::swap(size_, other.size_);
+    std::swap(meta_, other.meta_);
+    std::swap(data_, other.data_);
+    std::swap(shares_data_, other.shares_data_);
+    std::swap(capacity_, other.capacity_);
+    std::swap(reserved_, other.reserved_);
+  }
+
   /**
    * @brief Shares the data with another tensor.
    *
@@ -339,14 +379,14 @@ class Tensor {
    */
   void ShareData(const Tensor& src) {
     meta_ = src.meta();
-    CAFFE_ENFORCE_EQ(
+    CAFFE_ENFORCE_EQ_WITH_CALLER(
         src.size_,
         size_,
         "Size mismatch - did you call reshape before sharing the data?");
     // It is possible that the source tensor hasn't called mutable_data() yet,
     // in which case ShareData() doesn't make much sense since we don't really
     // know what to share yet.
-    CAFFE_ENFORCE(
+    CAFFE_ENFORCE_WITH_CALLER(
         src.data_.get() || src.size_ == 0,
         "Source tensor has no content and has size > 0");
     // Finally, do sharing.
@@ -358,48 +398,39 @@ class Tensor {
   /**
    * @brief Shares the data with an externally managed pointer.
    *
-   * This is similar to ShareData() but the tensor does not take over ownership
-   * of the pointer, so the caller can explicitly manage the memory storage.
-   * One needs to make sure that the external memory is deallocated only after
-   * the tensor finishes using it.
+   * This is similar to ShareData() but the source is a pointer with an advanced
+   * deleter option. In default, no deletion takes place, and one needs to make
+   * sure that the external memory is deallocated only after the tensor finishes
+   * using it. If a Deleter object is passed in, when this tensor is reallocated
+   * or freed, the deleter function is going to be called.
    */
-  template <typename T>
-  void ShareExternalPointer(T* src, size_t capacity = 0) {
-    ShareExternalPointer(src, capacity, [](void*) -> void {});
+  template <typename T, typename Deleter = MemoryDeleter>
+  void ShareExternalPointer(T* src, size_t capacity = 0, Deleter d = nullptr) {
+    ShareExternalPointer(src, TypeMeta::Make<T>(), capacity, d);
   }
 
-  /**
-   * @brief Shares the data with an externally managed pointer.
-   *
-   * This overload takes a Deleter functor to be called when this tensor is
-   * reallocated or freed.
-   */
-  template <typename T, typename Deleter>
-  void ShareExternalPointer(T* src, size_t capacity, Deleter&& d) {
-    ShareExternalPointer(
-        src, TypeMeta::Make<T>(), capacity, std::forward<Deleter>(d));
-  }
-
-  void
-  ShareExternalPointer(void* src, const TypeMeta& meta, size_t capacity = 0) {
-    ShareExternalPointer(src, meta, capacity, [](void*) -> void {});
-  }
-
-  template <class Deleter>
+  template <typename Deleter = MemoryDeleter>
   void ShareExternalPointer(
       void* src,
       const TypeMeta& meta,
-      size_t capacity,
-      Deleter&& d) {
+      size_t capacity = 0,
+      Deleter d = nullptr) {
     meta_ = meta;
     CAFFE_ENFORCE_WITH_CALLER(
         meta_.id(),
         "To share with a raw external pointer you need to have meta "
         "already set.");
     CAFFE_ENFORCE_WITH_CALLER(
-        size_ > 0,
+        size_ >= 0,
         "To share data with a raw pointer, you need to set shape first.");
-    data_.reset(src, std::forward<Deleter>(d));
+    // Check if the deleter is a MemoryDeleter and is a simple nullptr.
+    if (std::is_same<MemoryDeleter, Deleter>::value &&
+        reinterpret_cast<MemoryDeleter*>(&d)[0] == nullptr) {
+      // Use aliasing constructor trick to avoid calling the destructor.
+      data_ = std::shared_ptr<void>(std::shared_ptr<void>(), src);
+    } else {
+      data_.reset(src, d);
+    }
     // Sets capacity. If not specified, we will implicitly assume that
     // the capacity is the current size.
     if (capacity) {
@@ -410,7 +441,7 @@ class Tensor {
     shares_data_ = true;
   }
 
-  bool shares_data() {
+  bool shares_data() const {
     return shares_data_;
   }
 
@@ -475,17 +506,18 @@ class Tensor {
         // destruction procedure.
         auto size = size_;
         auto dtor = meta_.dtor();
+        auto ptr_and_deleter = Context::New(size_ * meta_.itemsize());
+        auto deleter = ptr_and_deleter.second;
         data_.reset(
-            static_cast<void*>(Context::New(size_ * meta_.itemsize())),
-            [size, dtor](void* ptr) -> void {
-                dtor(ptr, size);
-                Context::Delete(ptr);
+            ptr_and_deleter.first, [size, dtor, deleter](void* ptr) -> void {
+              dtor(ptr, size);
+              deleter(ptr);
             });
         meta_.ctor()(data_.get(), size_);
       } else {
         // For fundamental type, new and delete is easier.
-        data_.reset(static_cast<void*>(Context::New(size_ * meta_.itemsize())),
-                    Context::Delete);
+        auto ptr_and_deleter = Context::New(size_ * meta_.itemsize());
+        data_.reset(ptr_and_deleter.first, ptr_and_deleter.second);
       }
       capacity_ = size_ * meta_.itemsize();
       return data_.get();
@@ -592,9 +624,11 @@ class Tensor {
    * call dim() instead.
    */
   inline int dim32(const int i) const {
-    DCHECK_LT(i, dims_.size()) << "Exceeding ndim limit " << dims_.size();
-    DCHECK_GE(i, 0) << "Cannot have negative index";
-    CAFFE_ENFORCE_LT(dims_[i], std::numeric_limits<int>::max());
+    #ifndef NDEBUG
+    CAFFE_ENFORCE_LT_WITH_CALLER(i, dims_.size(), "Exceeding ndim limit");
+    CAFFE_ENFORCE_GE_WITH_CALLER(i, 0, "Cannot have negative dimension index");
+    #endif
+    CAFFE_ENFORCE_LT_WITH_CALLER(dims_[i], std::numeric_limits<int>::max());
     return static_cast<int>(dims_[i]);
   }
 
@@ -604,8 +638,10 @@ class Tensor {
    * this function will produce a fatal message.
    */
   inline TIndex dim(const int i) const {
-    DCHECK_LT(i, dims_.size()) << "Exceeding ndim limit " << dims_.size();
-    DCHECK_GE(i, 0) << "Cannot have negative index";
+    #ifndef NDEBUG
+    CAFFE_ENFORCE_LT_WITH_CALLER(i, dims_.size(), "Exceeding ndim limit");
+    CAFFE_ENFORCE_GE_WITH_CALLER(i, 0, "Cannot have negative dimension index");
+    #endif
     return dims_[i];
   }
 
@@ -616,6 +652,7 @@ class Tensor {
   std::shared_ptr<void> data_;
   bool shares_data_ = false;
   size_t capacity_ = 0;
+  bool reserved_ = false;
   // In case of chunk load we store how much data was already loaded
 
  private:
@@ -694,26 +731,36 @@ typedef Tensor<CPUContext> TensorCPU;
 constexpr int k_limit_default_ = 1000;
 
 // Type call registry
-typedef TypeMeta (*TypeCall)(void*);
+typedef TypeMeta (*TypeCall)(const void*);
 TypeCall GetTypeCallFunction(CaffeTypeId id);
 void RegisterTypeCallFunction(CaffeTypeId id, TypeCall c);
 
 template <class Context>
-TypeMeta GetTensorType(void* c) {
-  Tensor<Context>* tc = static_cast<Tensor<Context>*>(c);
+TypeMeta GetTensorType(const void* c) {
+  const Tensor<Context>* tc = static_cast<const Tensor<Context>*>(c);
   return tc->meta();
 }
 
 // Shape call registry
-typedef vector<TIndex> (*ShapeCall)(void*, bool& shares_data, size_t& capacity);
-ShapeCall GetShapeCallFunction(CaffeTypeId id);
-void RegisterShapeCallFunction(CaffeTypeId id, ShapeCall c);
+typedef vector<TIndex> (*TensorInfoCall)(
+    const void*,
+    bool* shares_data,
+    size_t* capacity,
+    DeviceOption* device);
+TensorInfoCall GetTensorInfoFunction(CaffeTypeId id);
+void RegisterTensorInfoFunction(CaffeTypeId id, TensorInfoCall c);
 
 template <class Context>
-vector<TIndex> GetTensorShape(void* c, bool& shares_data, size_t& capacity) {
-  Tensor<Context>* tc = static_cast<Tensor<Context>*>(c);
-  shares_data = tc->shares_data();
-  capacity = tc->capacity_nbytes();
+vector<TIndex> GetTensorInfo(
+    const void* c,
+    bool* shares_data,
+    size_t* capacity,
+    DeviceOption* device) {
+  const Tensor<Context>* tc = static_cast<const Tensor<Context>*>(c);
+  *shares_data = tc->shares_data();
+  *capacity = tc->capacity_nbytes();
+  device->set_device_type(CPU);
+  device->set_cuda_gpu_id(0);
   return tc->dims();
 }
 
@@ -731,7 +778,6 @@ class TensorPrinter {
   template <class Context>
   void PrintMeta(const Tensor<Context>& tensor);
 
- private:
   string MetaStr(const Tensor<CPUContext>& tensor);
 
  private:

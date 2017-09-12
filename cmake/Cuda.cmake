@@ -1,7 +1,11 @@
 # Known NVIDIA GPU achitectures Caffe2 can be compiled for.
+##set(Caffe2_known_gpu_archs9 "30 35 50 52 60 61 70 71") # for CUDA 9.x, not supported yet
+set(Caffe2_known_gpu_archs8 "20 21(20) 30 35 50 52 60 61") # for CUDA 8.x
+set(Caffe2_known_gpu_archs7 "20 21(20) 30 35 50 52") # for CUDA 7.x
 # This list will be used for CUDA_ARCH_NAME = All option
-set(Caffe2_known_gpu_archs "20 21(20) 30 35 50 52 60 61")
+set(Caffe2_known_gpu_archs "20 21(20) 30 35 50 52 60 61 70")
 set(Caffe2_known_gpu_archs7 "20 21(20) 30 35 50 52")
+set(Caffe2_known_gpu_archs8 "20 21(20) 30 35 50 52 60 61")
 
 ################################################################################################
 # A function for automatic detection of GPUs installed  (if autodetection is enabled)
@@ -27,7 +31,7 @@ function(caffe2_detect_installed_gpus out_variable)
       "  return 0;\n"
       "}\n")
 
-    execute_process(COMMAND "${CUDA_NVCC_EXECUTABLE}" "--run" "${__cufile}"
+    execute_process(COMMAND "${CUDA_NVCC_EXECUTABLE}" "-ccbin=${CUDA_HOST_COMPILER}" ${CUDA_NVCC_FLAGS} "--run" "${__cufile}"
                     WORKING_DIRECTORY "${PROJECT_BINARY_DIR}/CMakeFiles/"
                     RESULT_VARIABLE __nvcc_res OUTPUT_VARIABLE __nvcc_out
                     ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
@@ -84,6 +88,10 @@ function(caffe2_select_nvcc_arch_flags out_variable)
     set(__cuda_arch_bin "30 35")
   elseif(${CUDA_ARCH_NAME} STREQUAL "Maxwell")
     set(__cuda_arch_bin "50")
+  elseif(${CUDA_ARCH_NAME} STREQUAL "Pascal")
+    set(__cuda_arch_bin "60 61")
+  elseif(${CUDA_ARCH_NAME} STREQUAL "Volta")
+    set(__cuda_arch_bin "70")
   elseif(${CUDA_ARCH_NAME} STREQUAL "All")
     set(__cuda_arch_bin ${Caffe2_known_gpu_archs})
   elseif(${CUDA_ARCH_NAME} STREQUAL "Auto")
@@ -176,17 +184,22 @@ endif()
 
 set(HAVE_CUDA TRUE)
 message(STATUS "CUDA detected: " ${CUDA_VERSION})
-if (${CUDA_VERSION} LESS 8.0)
+if (${CUDA_VERSION} LESS 7.0)
+  message(FATAL_ERROR "Caffe2 requires CUDA 7.0 or later version")
+elseif (${CUDA_VERSION} LESS 8.0) # CUDA 7.x
   set(Caffe2_known_gpu_archs ${Caffe2_known_gpu_archs7})
   list(APPEND CUDA_NVCC_FLAGS "-D_MWAITXINTRIN_H_INCLUDED")
   list(APPEND CUDA_NVCC_FLAGS "-D__STRICT_ANSI__")
-else()
+elseif (${CUDA_VERSION} LESS 9.0) # CUDA 8.x
+  set(Caffe2_known_gpu_archs ${Caffe2_known_gpu_archs8})
+  list(APPEND CUDA_NVCC_FLAGS "-D_MWAITXINTRIN_H_INCLUDED")
+  list(APPEND CUDA_NVCC_FLAGS "-D__STRICT_ANSI__")
   # CUDA 8 may complain that sm_20 is no longer supported. Suppress the
   # warning for now.
   list(APPEND CUDA_NVCC_FLAGS "-Wno-deprecated-gpu-targets")
 endif()
 
-include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
+caffe2_include_directories(${CUDA_INCLUDE_DIRS})
 list(APPEND Caffe2_DEPENDENCY_LIBS ${CUDA_CUDART_LIBRARY}
                               ${CUDA_curand_LIBRARY} ${CUDA_CUBLAS_LIBRARIES})
 

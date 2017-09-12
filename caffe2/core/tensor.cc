@@ -8,6 +8,12 @@ CAFFE2_DEFINE_bool(
     true,
     "If set, keeps memory when a tensor is shrinking its size.");
 
+CAFFE2_DEFINE_int64(
+    caffe2_max_keep_on_shrink_memory,
+    LLONG_MAX,
+    "The maximum memory in bytes to keep on shrink, if the difference between "
+    "tensor sizes is bigger than this then tensor will be reset.");
+
 namespace caffe2 {
 // declaring it here instead of context.cc because tensor.h includes context.h
 CAFFE_KNOWN_TYPE(Tensor<CPUContext>);
@@ -66,20 +72,19 @@ void RegisterTypeCallFunction(CaffeTypeId id, TypeCall c) {
   type_call_registry_[id] = c;
 }
 
-static CaffeMap<CaffeTypeId, ShapeCall> shape_call_registry_ {
-  {TypeMeta::Id<Tensor<CPUContext>>(), GetTensorShape<Tensor<CPUContext>>}
-};
+static CaffeMap<CaffeTypeId, TensorInfoCall> tensor_info_call_registry_{
+    {TypeMeta::Id<Tensor<CPUContext>>(), GetTensorInfo<Tensor<CPUContext>>}};
 
-ShapeCall GetShapeCallFunction(CaffeTypeId id) {
-  auto f = shape_call_registry_.find(id);
-  if (f == shape_call_registry_.end()) {
+TensorInfoCall GetTensorInfoFunction(CaffeTypeId id) {
+  auto f = tensor_info_call_registry_.find(id);
+  if (f == tensor_info_call_registry_.end()) {
     return nullptr;
   }
   return f->second;
 }
 
-void RegisterShapeCallFunction(CaffeTypeId id, ShapeCall c) {
-  shape_call_registry_[id] = c;
+void RegisterTensorInfoFunction(CaffeTypeId id, TensorInfoCall c) {
+  tensor_info_call_registry_[id] = c;
 }
 
 namespace {

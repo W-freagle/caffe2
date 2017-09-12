@@ -119,6 +119,7 @@ class ConvPoolOpBase : public Operator<Context> {
     if (pads_.size() == 0) {
       pads_.resize(kernel_.size() * 2, 0);
     }
+
     if (dilation_.size() == 0) {
       dilation_.resize(kernel_.size(), 1);
     }
@@ -260,11 +261,11 @@ class ConvPoolOpBase : public Operator<Context> {
   // kernel parameters and output output_dims and channel_first.
   static inline void InferOutputSize(
       vector<TIndex> input_dims,
-      int output_channel,
+      int /*output_channel*/,
       StorageOrder order,
       bool global_pooling,
       LegacyPadding legacy_pad,
-      int N,
+      int /*N*/,
       vector<int>& kernel,
       vector<int>& output_dims,
       vector<int> dilation,
@@ -356,11 +357,50 @@ class ConvPoolOpBase : public Operator<Context> {
     CAFFE_NOT_IMPLEMENTED;
   }
 
+  static struct OpSchema::Cost CostInferenceForConv(
+      const OperatorDef& def,
+      const vector<TensorShape>& inputs) {
+    struct OpSchema::Cost c;
+    const TensorShape X = inputs[0];
+    const TensorShape W = inputs[1];
+
+    ArgumentHelper helper(def);
+    const auto order =
+        StringToStorageOrder(helper.GetSingleArgument<string>("order", "NCHW"));
+
+    unsigned long long X_h;
+    unsigned long long X_w;
+    unsigned long long kernel_h;
+    unsigned long long kernel_w;
+    unsigned long long in_channels;
+    unsigned long long out_channels;
+    if (order == StorageOrder::NHWC) {
+      X_h = X.dims(1);
+      X_w = X.dims(2);
+      kernel_h = W.dims(1);
+      kernel_w = W.dims(2);
+      in_channels = W.dims(3);
+      out_channels = W.dims(0);
+    } else {
+      X_h = X.dims(2);
+      X_w = X.dims(3);
+      kernel_h = W.dims(2);
+      kernel_w = W.dims(3);
+      in_channels = W.dims(1);
+      out_channels = W.dims(0);
+    }
+    c.flops = (X_h - kernel_h + 1) * (X_w - kernel_w + 1) * kernel_w *
+        kernel_h * in_channels * out_channels * 2;
+    return c;
+  }
+
   static vector<TensorShape> TensorInferenceForSchema(
       const OperatorDef& def,
       const vector<TensorShape>& in,
       int output_channel) {
     ArgumentHelper helper(def);
+    CAFFE_ENFORCE_GT(in.size(), 0);
+    CAFFE_ENFORCE_GT(in[0].dims_size(), 0);
     int N = in[0].dims(0);
     bool channel_first;
 

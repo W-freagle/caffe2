@@ -17,7 +17,6 @@ set(Caffe2_GPU_TEST_SRCS)
 
 add_subdirectory(proto)
 
-add_subdirectory(binaries)
 add_subdirectory(contrib)
 add_subdirectory(core)
 add_subdirectory(cuda_rtc)
@@ -25,13 +24,17 @@ add_subdirectory(db)
 add_subdirectory(distributed)
 # add_subdirectory(experiments) # note, we may remove this folder at some point
 add_subdirectory(image)
+add_subdirectory(video)
 add_subdirectory(mkl)
+add_subdirectory(mobile)
 add_subdirectory(mpi)
 add_subdirectory(operators)
+add_subdirectory(perfkernels)
 add_subdirectory(python)
 add_subdirectory(queue)
 add_subdirectory(sgd)
 # add_subdirectory(test) # todo: use caffe2_gtest_main instead of gtest_main because we will need to call GlobalInit
+add_subdirectory(transforms)
 add_subdirectory(utils)
 
 # Advanced: if we have white list specified, we will do intersections for all
@@ -76,7 +79,7 @@ set(Caffe2_MAIN_LIBS_ORDER ${Caffe2_MAIN_LIBS})
 # Compile exposed libraries.
 add_library(Caffe2_CPU ${Caffe2_CPU_SRCS} $<TARGET_OBJECTS:Caffe_PROTO> $<TARGET_OBJECTS:Caffe2_PROTO>)
 target_link_libraries(Caffe2_CPU ${Caffe2_DEPENDENCY_LIBS})
-install(TARGETS Caffe2_CPU DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+install(TARGETS Caffe2_CPU DESTINATION lib)
 list(APPEND Caffe2_MAIN_LIBS_ORDER Caffe2_CPU)
 if (BUILD_SHARED_LIBS)
   list(APPEND Caffe2_MAIN_LIBS Caffe2_CPU)
@@ -84,29 +87,21 @@ else()
   caffe_add_whole_archive_flag(Caffe2_CPU tmp)
   list(APPEND Caffe2_MAIN_LIBS ${tmp})
 endif()
+if (Caffe2_EXTERNAL_DEPENDENCIES)
+  add_dependencies(Caffe2_CPU ${Caffe2_EXTERNAL_DEPENDENCIES})
+endif()
 
 # Write the macros file.
-file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/caffe2/core)
-file(WRITE ${PROJECT_BINARY_DIR}/caffe2/core/macros.h
-     "// Automatically generated header file for caffe2 macros. These \n"
-     "// macros are used to build the Caffe2 binary, and if you are \n"
-     "// building a dependent library, they will need to be set as well \n"
-     "// for your program to link correctly.\n\n"
-     "#pragma once\n\n")
-get_directory_property(tmp DIRECTORY ${PROJECT_SOURCE_DIR} COMPILE_DEFINITIONS)
-foreach(item ${tmp})
-  if (${item} MATCHES "CAFFE2.*")
-    file(APPEND ${PROJECT_BINARY_DIR}/caffe2/core/macros.h
-         "\n#ifndef ${item}\n#define ${item}\n#endif // ${item}\n")
-  endif()
-endforeach()
+configure_file(
+    ${PROJECT_SOURCE_DIR}/caffe2/core/macros.h.in
+    ${PROJECT_BINARY_DIR}/caffe2/core/macros.h)
 
 # Installing the header files
 install(DIRECTORY ${CMAKE_CURRENT_LIST_DIR}
-        DESTINATION ${CMAKE_INSTALL_PREFIX}/include/
+        DESTINATION include
         FILES_MATCHING PATTERN "*.h")
 install(FILES ${PROJECT_BINARY_DIR}/caffe2/core/macros.h
-        DESTINATION ${CMAKE_INSTALL_PREFIX}/include/caffe2/core/)
+        DESTINATION include/caffe2/core)
 
 # ---[ CUDA library.
 if(USE_CUDA)
@@ -120,8 +115,12 @@ if(USE_CUDA)
     caffe_add_whole_archive_flag(Caffe2_GPU tmp)
     list(APPEND Caffe2_MAIN_LIBS ${tmp})
   endif()
-  install(TARGETS Caffe2_GPU DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
+  if (Caffe2_EXTERNAL_DEPENDENCIES)
+    add_dependencies(Caffe2_GPU ${Caffe2_EXTERNAL_DEPENDENCIES})
+  endif()
+  install(TARGETS Caffe2_GPU DESTINATION lib)
   link_directories(${CMAKE_INSTALL_PREFIX}/lib)
+  add_dependencies(Caffe2_GPU Caffe2_PROTO)
 endif()
 
 # ---[ Test binaries.
@@ -140,7 +139,7 @@ if (BUILD_TEST)
       target_compile_features(${test_name} PRIVATE cxx_range_for)
     endif()
     add_test(NAME ${test_name} COMMAND $<TARGET_FILE:${test_name}>)
-    install(TARGETS ${test_name} DESTINATION ${CMAKE_INSTALL_PREFIX}/test)
+    install(TARGETS ${test_name} DESTINATION test)
   endforeach()
 endif()
 
@@ -172,9 +171,7 @@ if (BUILD_PYTHON)
         COMMAND install_name_tool -add_rpath ${CMAKE_INSTALL_PREFIX}/lib
                 $<TARGET_FILE:caffe2_pybind11_state>)
   endif()
-  install(
-      TARGETS caffe2_pybind11_state DESTINATION
-      ${CMAKE_INSTALL_PREFIX}/caffe2/python)
+  install(TARGETS caffe2_pybind11_state DESTINATION caffe2/python)
 
   if(USE_CUDA)
     add_library(caffe2_pybind11_state_gpu MODULE ${Caffe2_GPU_PYTHON_SRCS})
@@ -197,12 +194,10 @@ if (BUILD_PYTHON)
           COMMAND install_name_tool -add_rpath ${CMAKE_INSTALL_PREFIX}/lib
                   $<TARGET_FILE:caffe2_pybind11_state_gpu>)
     endif()
-    install(
-        TARGETS caffe2_pybind11_state_gpu DESTINATION
-        ${CMAKE_INSTALL_PREFIX}/caffe2/python)
+    install(TARGETS caffe2_pybind11_state_gpu DESTINATION caffe2/python)
   endif()
 
-  if (MSVC)
+  if (MSVC AND CMAKE_GENERATOR MATCHES "Visual Studio")
     # If we are building under windows, we will copy the file from
     # build/caffe2/python/{Debug,Release}/caffe2_pybind11_state.pyd
     # to its parent folder so that we can do in-build execution.
@@ -211,31 +206,66 @@ if (BUILD_PYTHON)
     add_custom_command(
         TARGET windows_python_copy_lib POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy
-        ${CMAKE_BINARY_DIR}/caffe2/python/${CMAKE_BUILD_TYPE}/caffe2_pybind11_state.pyd
+        $<TARGET_FILE:caffe2_pybind11_state>
         ${CMAKE_BINARY_DIR}/caffe2/python)
     if (USE_CUDA)
       add_dependencies(windows_python_copy_lib caffe2_pybind11_state_gpu)
       add_custom_command(
           TARGET windows_python_copy_lib POST_BUILD
           COMMAND ${CMAKE_COMMAND} -E copy
-          ${CMAKE_BINARY_DIR}/caffe2/python/${CMAKE_BUILD_TYPE}/caffe2_pybind11_state_gpu.pyd
+          $<TARGET_FILE:caffe2_pybind11_state_gpu>
           ${CMAKE_BINARY_DIR}/caffe2/python)
     endif()
   endif()
-endif()
 
-# ---[ Binaries.
-if (BUILD_BINARY)
-  set(Caffe2_ALL_BINARY_SRCS ${Caffe2_CPU_BINARY_SRCS})
-  if (USE_CUDA)
-    list(APPEND Caffe2_ALL_BINARY_SRCS ${Caffe2_GPU_BINARY_SRCS})
+  # Finally, Copy all python files to build directory
+  # Generate and create all needed __init__.py files, if they aren't already
+  # present in the current source tree.
+  message(STATUS "Automatically generating missing __init__.py files.")
+  caffe_autogen_init_py_files()
+
+  # Create a custom target that copies all python files.
+  file(GLOB_RECURSE PYTHON_SRCS RELATIVE ${PROJECT_SOURCE_DIR}
+       "${PROJECT_SOURCE_DIR}/caffe2/*.py")
+  add_custom_target(python_copy_files ALL)
+  if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja")
+    # ninja fails when the command line is too long so we split
+    # the target into several. This would be beneficial for VS also
+    # since it build targets in parallel but not custom commands
+    foreach(python_src ${PYTHON_SRCS})
+      get_filename_component(dir ${python_src} DIRECTORY)
+      string(SHA1 name_hash "${python_src}")
+      # get_filename_component(name_we ${python_src} NAME_WE)
+      add_custom_target(python_copy_files_${name_hash}
+          COMMAND ${CMAKE_COMMAND} -E copy
+          ${PROJECT_SOURCE_DIR}/${python_src} ${CMAKE_BINARY_DIR}/${dir})
+      add_dependencies(python_copy_files python_copy_files_${name_hash})
+    endforeach()
+  else()
+    foreach(python_src ${PYTHON_SRCS})
+      get_filename_component(dir ${python_src} DIRECTORY)
+      add_custom_command(
+          TARGET python_copy_files PRE_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy
+          ${PROJECT_SOURCE_DIR}/${python_src} ${CMAKE_BINARY_DIR}/${dir})
+    endforeach()
   endif()
 
-  foreach(binary_src ${Caffe2_ALL_BINARY_SRCS})
-    get_filename_component(bin_name ${binary_src} NAME_WE)
-    add_executable(${bin_name} ${binary_src})
-    add_dependencies(${bin_name} ${Caffe2_MAIN_LIBS_ORDER})
-    target_link_libraries(${bin_name} ${Caffe2_MAIN_LIBS} ${Caffe2_DEPENDENCY_LIBS})
-    install(TARGETS ${bin_name} DESTINATION ${CMAKE_INSTALL_PREFIX}/binaries)
-  endforeach()
+  # Install commands
+  # Pick up static python files
+  install(DIRECTORY ${CMAKE_BINARY_DIR}/caffe2 DESTINATION .
+          FILES_MATCHING PATTERN "*.py")
+  # Caffe proto files
+  install(DIRECTORY ${CMAKE_BINARY_DIR}/caffe DESTINATION .
+          FILES_MATCHING PATTERN "*.py")
+  # Caffe2 proto files
+  install(DIRECTORY ${CMAKE_BINARY_DIR}/caffe2 DESTINATION .
+          FILES_MATCHING PATTERN "*.py")
+endif()
+
+
+# ---[ Any builds that should happen after the main targets should be added here.
+# Binaries
+if (BUILD_BINARY)
+  add_subdirectory(binaries)
 endif()

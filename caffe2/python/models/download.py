@@ -21,7 +21,8 @@ except ImportError:
     HTTPError = urllib.HTTPError
     URLError = urllib.URLError
 
-DOWNLOAD_BASE_URL = "https://s3.amazonaws.com/caffe2/models/"
+# urllib requires more work to deal with a redirect, so not using vanity url
+DOWNLOAD_BASE_URL = "https://s3.amazonaws.com/download.caffe2.ai/models/"
 DOWNLOAD_COLUMNS = 70
 
 
@@ -65,7 +66,7 @@ def downloadFromURLToFile(url, filename):
                 if not data_chunk:
                     break
                 local_file.write(data_chunk)
-                downloaded_size += chunk
+                downloaded_size += len(data_chunk)
                 progressBar(int(100 * downloaded_size / size))
         print("")  # New line to fix for progress bar
     except HTTPError as e:

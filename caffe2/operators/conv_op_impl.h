@@ -7,11 +7,8 @@
 #include "caffe2/core/logging.h"
 #include "caffe2/core/operator.h"
 #include "caffe2/operators/conv_op.h"
-#include "caffe2/operators/conv_op_shared.h"
 #include "caffe2/operators/conv_pool_op_base.h"
 #include "caffe2/utils/math.h"
-
-CAFFE2_DECLARE_bool(caffe2_force_shared_col_buffer);
 
 namespace caffe2 {
 
@@ -199,7 +196,7 @@ bool ConvOp<T, Context>::RunOnDeviceWithOrderNHWC() {
   CAFFE_ENFORCE_EQ(
       kernel_.size(),
       2,
-      "Only 2d convlution is supported for NHWC storage type");
+      "Only 2d convolution is supported for NHWC storage type");
 
   CAFFE_ENFORCE(X.ndim(), filter.ndim());
   const int M = filter.dim32(0);
